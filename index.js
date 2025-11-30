@@ -5,6 +5,15 @@ require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const app = express();
+const crypto = require("crypto");
+
+function generateTrackingID() {
+  const prefix = "PRCL";
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const random = crypto.randomBytes(3).toString("hex").toUpperCase();
+
+  return `${prefix}-${date}-${random}`;
+}
 
 // Middleware ----------------------------------------->
 app.use(express.json());
@@ -27,6 +36,7 @@ async function run() {
 
     const db = client.db("zap-shift");
     const parcelCollection = db.collection("parcels");
+    const paymentCollection = db.collection("payments");
 
     // Get parcel by email api cal ----------------------|
     app.get("/parcels", async (req, res) => {
@@ -114,6 +124,7 @@ async function run() {
         mode: "payment",
         metadata: {
           parcelId: paymentInfo.parcelId,
+          parcelName: paymentInfo.parcelName,
         },
         customer_email: paymentInfo.senderEmail,
         success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
@@ -125,19 +136,70 @@ async function run() {
     app.patch("/payment-success", async (req, res) => {
       const sessionId = req.query.session_id;
       const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const trackingId = generateTrackingID();
+
+      const transactionId = session.payment_intent;
+      const query = { transactionId: transactionId };
+
+      const paymentExist = await paymentCollection.findOne(query);
+      console.log(paymentExist);
+      if (paymentExist) {
+        return res.send({
+          message: "Transaction Id Already Exits:",
+          transactionId,
+          trackingId: trackingId,
+        });
+      }
+
       if (session.payment_status === "paid") {
         const id = session.metadata.parcelId;
         const query = { _id: new ObjectId(id) };
         const update = {
           $set: {
             paymentStatus: "paid",
+            trackingId: trackingId,
           },
         };
         const result = await parcelCollection.updateOne(query, update);
+
+        const payment = {
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          customerEmail: session.customer_email,
+          parcelId: session.metadata.parcelId,
+          parcelName: session.metadata.parcelName,
+          transactionId: session.payment_intent,
+          paymentStatus: session.payment_status,
+          paidAt: new Date(),
+          trackingId: trackingId,
+        };
+
+        if (session.payment_status === "paid") {
+          const resultPayment = await paymentCollection.insertOne(payment);
+          res.send({
+            success: true,
+            modifyParcel: result,
+            paymentInfo: resultPayment,
+            trackingId: trackingId,
+            transactionId: session.payment_intent,
+          });
+        }
+
         res.send(result);
       }
 
       res.send({ success: false });
+    });
+
+    app.get("/payments", async (req, res) => {
+      const email = req.query.email;
+      const query = {};
+      if (email) {
+        query.customerEmail = email;
+      }
+      const cursor = paymentCollection.find(query);
+      const result = await cursor.toArray();
+      res.send(result);
     });
 
     await client.db("admin").command({ ping: 1 });
